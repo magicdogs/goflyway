@@ -1,171 +1,526 @@
 package main
 
 import (
-	"github.com/coyove/goflyway/pkg/config"
-	"github.com/coyove/goflyway/pkg/logg"
-	"github.com/coyove/goflyway/pkg/lookup"
-	"github.com/coyove/goflyway/proxy"
-
-	"flag"
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
-	"runtime"
+	"math/rand"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/coyove/common/sched"
+	"github.com/coyove/goflyway"
+	"github.com/coyove/goflyway/v"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 var (
-	G_Config = flag.String("c", "", "config file path")
-
-	G_Key         = flag.String("k", "0123456789abcdef", "key, important")
-	G_Auth        = flag.String("a", "", "proxy authentication, form: username:password (remember the colon)")
-	G_Upstream    = flag.String("up", "", "upstream server address (e.g. 127.0.0.1:8100)")
-	G_Local       = flag.String("l", ":8100", "local listening port (remember the colon)")
-	G_Local2      = flag.String("p", "", "local listening port, alias of -l")
-	G_UdpRelay    = flag.Int64("udp", 0, "UDP relay listening port, 0 to disable, not working yet")
-	G_UdpTcp      = flag.Int64("udp-tcp", 1, "use N TCP connections to relay UDP")
-	G_LogLevel    = flag.String("lv", "log", "logging level, whose value can be: dbg, log, warn, err or off")
-	G_GlobalProxy = flag.Bool("g", false, "global proxy")
-
-	G_Debug            = flag.Bool("debug", false, "debug mode")
-	G_ProxyPassAddr    = flag.String("proxy-pass", "", "use goflyway as a reverse proxy, http only")
-	G_DisableConsole   = flag.Bool("disable-console", false, "disable the console access")
-	G_RecordLocalError = flag.Bool("local-error", false, "log all localhost errors")
-	G_PartialEncrypt   = flag.Bool("partial", false, "partially encrypt the tunnel traffic")
-
-	G_DNSCacheEntries = flag.Int("dns-cache", 1024, "DNS cache size")
-	G_Throttling      = flag.Int64("throttling", 0, "traffic throttling, experimental")
-	G_ThrottlingMax   = flag.Int64("throttling-max", 1024*1024, "traffic throttling token bucket max capacity")
+	version      = "__devel__"
+	remoteAddr   string
+	localAddr    string
+	addr         string
+	httpsProxy   string
+	resetTraffic bool
+	cconfig      = &goflyway.ClientConfig{}
+	sconfig      = &goflyway.ServerConfig{}
 )
 
-func LoadConfig() {
-	flag.Parse()
-
-	path := *G_Config
-
-	if path != "" {
-		buf, err := ioutil.ReadFile(path)
-		if err != nil {
-			logg.F(err)
-		}
-
-		cf, err := config.ParseConf(string(buf))
-		if err != nil {
-			logg.F(err)
-		}
-
-		*G_Key = cf.GetString("default", "key", *G_Key)
-		*G_Auth = cf.GetString("default", "auth", *G_Auth)
-		*G_Local = cf.GetString("default", "listen", *G_Local)
-		*G_Upstream = cf.GetString("default", "upstream", *G_Upstream)
-		*G_UdpRelay = cf.GetInt("default", "udp", *G_UdpRelay)
-		*G_UdpTcp = cf.GetInt("default", "udptcp", *G_UdpTcp)
-		*G_LogLevel = cf.GetString("default", "loglevel", *G_LogLevel)
-		*G_GlobalProxy = cf.GetBool("default", "global", *G_GlobalProxy)
-		*G_RecordLocalError = cf.GetBool("misc", "localerror", *G_RecordLocalError)
-		*G_ProxyPassAddr = cf.GetString("misc", "proxypass", *G_ProxyPassAddr)
-
-		*G_DisableConsole = cf.GetBool("misc", "disableconsole", *G_DisableConsole)
-		*G_DNSCacheEntries = int(cf.GetInt("misc", "dnscache", int64(*G_DNSCacheEntries)))
-		*G_PartialEncrypt = cf.GetBool("misc", "partial", *G_PartialEncrypt)
-
-		*G_Throttling = cf.GetInt("experimental", "throttling", *G_Throttling)
-		*G_ThrottlingMax = cf.GetInt("experimental", "throttlingmax", *G_ThrottlingMax)
+func printHelp(a ...interface{}) {
+	if len(a) > 0 {
+		fmt.Printf("goflyway: ")
+		fmt.Println(a...)
 	}
+	fmt.Println("usage: goflyway -DLhHUvkqpPtTwWy address:port")
+	os.Exit(0)
 }
 
 func main() {
-	logg.Start()
-	fmt.Println(`     __//                   __ _
-    /.__.\                 / _| |
-    \ \/ /      __ _  ___ | |_| |_   ___      ____ _ _   _
- '__/    \     / _' |/ _ \|  _| | | | \ \ /\ / / _' | | | |
-  \-      )   | (_| | (_) | | | | |_| |\ V  V / (_| | |_| |
-   \_____/     \__, |\___/|_| |_|\__, | \_/\_/ \__,_|\__, |
- ____|_|____    __/ |             __/ |               __/ |
-     " "  cf   |___/             |___/               |___/
- `)
+	sched.Verbose = false
 
-	LoadConfig()
-	logg.SetLevel(*G_LogLevel)
-	logg.RecordLocalhostError(*G_RecordLocalError)
+	for i, last := 1, rune(0); i < len(os.Args); i++ {
+		p := strings.TrimLeft(os.Args[i], "-")
 
-	if *G_Key == "0123456789abcdef" {
-		logg.W("you are using the default key, please change it by setting -k=KEY")
+		// HACK: ss-local compatible command flags
+		if p == "fast-open" || p == "V" || p == "u" || p == "m" || p == "b" {
+			if i < len(os.Args)-1 && !strings.HasPrefix(os.Args[i+1], "-") {
+				i++
+			}
+			continue
+		}
+
+		if len(p) != len(os.Args[i]) {
+			for i, c := range p {
+				switch c {
+				case 'h':
+					printHelp()
+				//case 'V':
+				//	printHelp(version)
+				case 'L', 'P', 'p', 'k', 't', 'T', 'W', 'H', 'U', 'D', 'c':
+					last = c
+				case 'v':
+					v.Verbose++
+				case 'q':
+					v.Verbose = -1
+				case 'w':
+					cconfig.WebSocket = true
+				case 'y':
+					resetTraffic = true
+				case '=':
+					i++
+					fallthrough
+				default:
+					if last == 0 {
+						printHelp("illegal option --", string(c))
+					}
+					p = p[i:]
+					goto PARSE
+				}
+			}
+			continue
+		}
+	PARSE:
+		if strings.HasPrefix(p, "\"") {
+			if p, _ = strconv.Unquote(p); p == "" {
+				printHelp("illegal option --", string(last))
+			}
+		}
+		switch last {
+		case 'D':
+			cconfig.Dynamic = true
+			fallthrough
+		case 'L':
+			switch parts := strings.Split(p, ":"); len(parts) {
+			case 1:
+				localAddr = ":" + parts[0]
+			case 2:
+				localAddr = p
+			case 3:
+				localAddr, remoteAddr = ":"+parts[0], parts[1]+":"+parts[2]
+			case 4:
+				localAddr, remoteAddr = parts[0]+":"+parts[1], parts[2]+":"+parts[3]
+			default:
+				printHelp("illegal option --", string(last), p)
+			}
+		case 'P':
+			sconfig.ProxyPassAddr = p
+		case 'U':
+			cconfig.PathPattern = p
+		case 'T':
+			speed, _ := strconv.ParseInt(p, 10, 64)
+			sconfig.SpeedThrot = goflyway.NewTokenBucket(speed, speed*25)
+		case 'W':
+			writebuffer, _ := strconv.ParseInt(p, 10, 64)
+			sconfig.WriteBuffer, cconfig.WriteBuffer = writebuffer, writebuffer
+		case 't':
+			*(*int64)(&cconfig.Timeout), _ = strconv.ParseInt(p+"000000000", 10, 64)
+			sconfig.Timeout = cconfig.Timeout
+		case 'p', 'k':
+			sconfig.Key, cconfig.Key = p, p
+		case 'H':
+			cconfig.URLHeader = p
+			httpsProxy = p
+		case 'c':
+			buf, _ := ioutil.ReadFile(p)
+			cmds := make(map[string]interface{})
+			json.Unmarshal(buf, &cmds)
+			cconfig.Key, cconfig.VPN = cmds["password"].(string), true
+			addr = fmt.Sprintf("%v:%v", cmds["server"], cmds["server_port"])
+
+			v.Verbose = 3
+			v.Vprint(os.Args, " config: ", cmds)
+		default:
+			addr = p
+		}
+		last = 0
 	}
 
-	if *G_Upstream != "" {
-		if !lookup.LoadOrCreateChinaList("") {
-			logg.W("cannot read chinalist.txt (but it's fine, you can ignore this msg)")
+	if addr == "" {
+		if localAddr == "" {
+			v.Vprint("assume you want a default server at :8100")
+			addr = ":8100"
+		} else {
+			printHelp("missing address:port to listen/connect")
 		}
 	}
 
-	cipher := &proxy.GCipher{
-		KeyString: *G_Key,
-		Partial:   *G_PartialEncrypt,
-	}
-	cipher.New()
-
-	cc := &proxy.ClientConfig{
-		DNSCacheSize:   *G_DNSCacheEntries,
-		GlobalProxy:    *G_GlobalProxy,
-		DisableConsole: *G_DisableConsole,
-		UserAuth:       *G_Auth,
-		Upstream:       *G_Upstream,
-		UDPRelayPort:   int(*G_UdpRelay),
-		UDPRelayCoconn: int(*G_UdpTcp),
-		GCipher:        cipher,
-	}
-
-	sc := &proxy.ServerConfig{
-		GCipher:        cipher,
-		UDPRelayListen: int(*G_UdpRelay),
-		Throttling:     *G_Throttling,
-		ThrottlingMax:  *G_ThrottlingMax,
-		ProxyPassAddr:  *G_ProxyPassAddr,
-	}
-
-	if *G_Auth != "" {
-		sc.Users = map[string]proxy.UserConfig{
-			*G_Auth: {},
+	if localAddr != "" && remoteAddr == "" {
+		_, port, err1 := net.SplitHostPort(localAddr)
+		host, _, err2 := net.SplitHostPort(addr)
+		remoteAddr = host + ":" + port
+		if err1 != nil || err2 != nil {
+			printHelp("invalid address --", localAddr, addr)
 		}
 	}
 
-	var client *proxy.ProxyClient
-	if *G_Debug {
-		logg.L("debug mode on, proxy listening port 8100")
+	if localAddr != "" && remoteAddr != "" {
+		cconfig.Bind = remoteAddr
+		cconfig.Upstream = addr
+		cconfig.Stat = &goflyway.Traffic{}
 
-		cc.Upstream = "127.0.0.1:8101"
-		client = proxy.NewClient(":8100", cc)
-		go logg.F(client.Start())
+		if v.Verbose > 0 {
+			go watchTraffic(cconfig, resetTraffic)
+		}
+		if cconfig.Dynamic {
+			v.Vprint("dynamic: forward ", localAddr, " to * through ", addr)
+		} else {
+			v.Vprint("forward ", localAddr, " to ", remoteAddr, " through ", addr)
+		}
+		if cconfig.WebSocket {
+			v.Vprint("relay: use Websocket protocol")
+		}
+		if a := os.Getenv("http_proxy") + os.Getenv("HTTP_PROXY"); a != "" {
+			v.Vprint("note: system HTTP proxy is set to: ", a)
+		}
+		if a := os.Getenv("https_proxy") + os.Getenv("HTTPS_PROXY"); a != "" {
+			v.Vprint("note: system HTTPS proxy is set to: ", a)
+		}
 
-		proxy.StartServer(":8101", sc)
+		v.Eprint(goflyway.NewClient(localAddr, cconfig))
+	} else if httpsProxy != "" {
+		v.Vprint("server listen on ", addr, " (https://", httpsProxy, ")")
+		m := &autocert.Manager{
+			Cache:      autocert.DirCache("secret-dir"),
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(httpsProxy),
+		}
+		s := &http.Server{
+			Addr:      addr,
+			TLSConfig: m.TLSConfig(),
+		}
+		for i, p := range s.TLSConfig.NextProtos {
+			if p == "h2" {
+				s.TLSConfig.NextProtos[i] = "h2-disabled"
+			}
+		}
+		s.Handler = &connector{
+			timeout: sconfig.Timeout,
+			auth:    sconfig.Key,
+		}
+		if os.Getenv("GFW_TEST") == "1" {
+			v.Eprint(s.ListenAndServe())
+		} else {
+			v.Eprint(s.ListenAndServeTLS("", ""))
+		}
+	} else {
+		v.Vprint("server listen on ", addr)
+		v.Eprint(goflyway.NewServer(addr, sconfig))
+	}
+}
+
+func watchTraffic(cconfig *goflyway.ClientConfig, reset bool) {
+	path := filepath.Join(os.TempDir(), "goflyway_traffic")
+
+	tmpbuf, _ := ioutil.ReadFile(path)
+	if len(tmpbuf) != 16 || reset {
+		tmpbuf = make([]byte, 16)
+	}
+
+	cconfig.Stat.Set(int64(binary.BigEndian.Uint64(tmpbuf)), int64(binary.BigEndian.Uint64(tmpbuf[8:])))
+
+	var lastSent, lastRecv int64
+	for range time.Tick(time.Second * 5) {
+		s, r := *cconfig.Stat.Sent(), *cconfig.Stat.Recv()
+		sv, rv := float64(s-lastSent)/1024/1024/5, float64(r-lastRecv)/1024/1024/5
+		lastSent, lastRecv = s, r
+
+		if sv >= 0.001 || rv >= 0.001 {
+			v.Vprint("client send: ", float64(s)/1024/1024, "M (", sv, "M/s), recv: ", float64(r)/1024/1024, "M (", rv, "M/s)")
+		}
+
+		binary.BigEndian.PutUint64(tmpbuf, uint64(s))
+		binary.BigEndian.PutUint64(tmpbuf[8:], uint64(r))
+		ioutil.WriteFile(path, tmpbuf, 0644)
+	}
+}
+
+type connector struct {
+	book    TTLMap
+	mu      sync.Mutex
+	timeout time.Duration
+	auth    string
+}
+
+func (c *connector) getClientIP(r *http.Request) string {
+	clientIP := r.Header.Get("X-Forwarded-For")
+	clientIP = strings.TrimSpace(strings.Split(clientIP, ",")[0])
+	if clientIP == "" {
+		clientIP = strings.TrimSpace(r.Header.Get("X-Real-Ip"))
+	}
+	if clientIP != "" {
+		return clientIP
+	}
+	if ip, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil {
+		return ip
+	}
+	return ""
+}
+
+func (c *connector) getFingerprint(r *http.Request) string {
+	return r.UserAgent() //+ "/" + r.Header.Get("Accept-Language")
+}
+
+func (c *connector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	plain, iscurl := false, false
+	pp := func() {
+		path := r.URL.Path
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		req, _ := http.NewRequest("GET", "https://arxiv.org"+path, nil)
+		req.Header.Add("Accept", "text/html")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			w.WriteHeader(500)
+			return
+		}
+		defer resp.Body.Close()
+		for k, v := range resp.Header {
+			w.Header().Add(k, v[0])
+		}
+		io.Copy(w, resp.Body)
+	}
+
+	if r.Method != "CONNECT" {
+		if r.URL.Host == "" {
+			pp()
+			return
+		}
+
+		v.VVprint("plain http proxy: ", r.URL.Host)
+		plain = true
+	}
+
+	// we are inside GFW and should pass data to upstream
+	host := r.URL.Host
+	if !regexp.MustCompile(`:\d+$`).MatchString(host) {
+		if plain {
+			host += ":80"
+		} else {
+			host += ":443"
+		}
+	}
+
+	ip := c.getClientIP(r)
+
+	if plain && host == c.auth+".com:80" {
+		w.Header().Add("Content-Type", "text/html")
+		w.Write([]byte(fmt.Sprintf("<title>Bookkeeper</title>Whitelisted: %s@%s", c.getFingerprint(r), c.getClientIP(r))))
+
+		c.book.Add(ip, "white", 0)
+		c.book.Add(c.getFingerprint(r), ip, 0)
 		return
 	}
 
-	if *G_Upstream != "" {
-		if *G_Local2 != "" {
-			// -p has higher priority than -l, for the sack of SS users
-			client = proxy.NewClient(*G_Local2, cc)
+	{ // Auth
+		c.mu.Lock()
+		state, _ := c.book.Get(ip)
+		if state == "white" {
+			goto OK
+		} else if state == "black" {
+			v.VVprint(ip, " is not known and is blocked")
 		} else {
-			client = proxy.NewClient(*G_Local, cc)
+			authData := strings.TrimPrefix(r.Header.Get("Proxy-Authorization"), "Basic ")
+			if authData == "" {
+				authData = strings.TrimPrefix(r.Header.Get("Authentication"), "Basic ")
+			}
+			pa, err := base64.StdEncoding.DecodeString(strings.TrimSpace(authData))
+			if err == nil && bytes.ContainsRune(pa, ':') {
+				if string(pa[bytes.IndexByte(pa, ':')+1:]) == c.auth {
+					goto OK
+				}
+			}
+
+			ip2, ok := c.book.Get(c.getFingerprint(r))
+			if !ok {
+				c.mu.Unlock()
+				pp()
+				return
+			}
+
+			if state2, ok := c.book.Get(ip2); ok && state2 == "white" {
+				v.VVprint(ip, " is not known, but fingerprint is okay")
+				c.book.Delete(ip2)
+				goto OK
+			}
+			v.VVprint(ip, " is not known nor is the fingerprint")
 		}
 
-		logg.L("Hi! ", client.Nickname, ", proxy is listening at ", client.Localaddr, ", upstream is ", client.Upstream)
-		logg.F(client.Start())
+		c.book.Add(ip, "black", time.Second*10)
+		c.mu.Unlock()
+
+		pp()
+		return
+
+	OK:
+		c.book.Add(ip, "white", 0)
+		c.book.Add(c.getFingerprint(r), ip, 0)
+		c.mu.Unlock()
+
+		iscurl = strings.Contains(strings.ToLower(r.UserAgent()), "curl/")
+	}
+
+	if plain {
+		resp, err := http.DefaultTransport.RoundTrip(r)
+		if err != nil {
+			w.WriteHeader(500)
+			return
+		}
+
+		defer resp.Body.Close()
+
+		for k := range w.Header() {
+			w.Header().Del(k)
+		}
+
+		for k, v := range resp.Header {
+			for _, v := range v {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	up, err := net.DialTimeout("tcp", host, c.timeout)
+	if err != nil {
+		v.Eprint(host, err)
+		w.WriteHeader(500)
+		return
+	}
+
+	hij, _ := w.(http.Hijacker) // No HTTP2
+	proxyClient, _, err := hij.Hijack()
+	if err != nil {
+		v.Eprint(host, err)
+		w.WriteHeader(500)
+		return
+	}
+
+	if iscurl {
+		proxyClient.Write([]byte("HTTP/1.1 200 OK\r\n"))
 	} else {
-		// save some space because server doesn't need lookup
-		lookup.ChinaList = nil
-		lookup.IPv4LookupTable = nil
-		lookup.IPv4PrivateLookupTable = nil
-		lookup.CHN_IP = ""
+		proxyClient.Write([]byte("HTTP/1.0 200 Connection Established\r\n"))
+	}
+	proxyClient.Write([]byte("Filler: "))
+	for i := 0; i < rand.Intn(100)+300; i++ {
+		proxyClient.Write([]byte("aaaaaaaa"))
+	}
+	proxyClient.Write([]byte("\r\n\r\n"))
 
-		// global variables are pain in the ass
-		runtime.GC()
+	go func() {
+		var wait = make(chan bool)
+		var err1, err2 error
+		var to1, to2 bool
 
-		if *G_Local2 != "" {
-			// -p has higher priority than -l, for the sack of SS users
-			proxy.StartServer(*G_Local2, sc)
-		} else {
-			proxy.StartServer(*G_Local, sc)
+		go func() {
+			err1, to1 = bridge(proxyClient, up, c.timeout)
+			wait <- true
+		}()
+
+		err2, to2 = bridge(up, proxyClient, c.timeout)
+		select {
+		case <-wait:
 		}
+
+		proxyClient.Close()
+		up.Close()
+
+		if to1 && to2 {
+			v.Vprint(host, " unbridged due to timeout")
+		} else if err1 != nil || err2 != nil {
+			v.Eprint(host, " unbridged due to error: ", err1, "(down<-up) or ", err2, "(up<-down)")
+		}
+	}()
+}
+
+func bridge(dst, src net.Conn, t time.Duration) (err error, timedout bool) {
+	buf := make([]byte, 1024*64)
+	for {
+		if t > 0 {
+			src.SetReadDeadline(time.Now().Add(t))
+		}
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[0:nr])
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if ne, _ := er.(net.Error); ne != nil && ne.Timeout() {
+				timedout = true
+				break
+			}
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return
+}
+
+type TTLMap struct {
+	m sync.Map
+}
+
+func (m *TTLMap) String() string {
+	p := bytes.Buffer{}
+	m.m.Range(func(k, v interface{}) bool {
+		p.WriteString(k.(string))
+		p.WriteString(":")
+		p.WriteString(fmt.Sprint(v))
+		p.WriteString(",")
+		return true
+	})
+	return p.String()
+}
+
+func (m *TTLMap) Add(key string, value string, ttl time.Duration) {
+	if ttl == 0 {
+		m.m.Store(key, value)
+	} else {
+		m.m.Store(key, [2]interface{}{value, time.Now().Add(ttl)})
+	}
+}
+
+func (m *TTLMap) Delete(key string) {
+	m.m.Delete(key)
+}
+
+func (m *TTLMap) Get(key string) (string, bool) {
+	v, ok := m.m.Load(key)
+	if !ok {
+		return "", false
+	}
+	switch v := v.(type) {
+	case string:
+		return v, true
+	case [2]interface{}:
+		if time.Now().After(v[1].(time.Time)) {
+			m.m.Delete(key)
+			return "", false
+		}
+		return v[0].(string), true
+	default:
+		panic("shouldn't happen")
 	}
 }
